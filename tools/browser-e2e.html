@@ -1,0 +1,1148 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <title>E2E</title>
+  </head>
+  <body>
+    <pre id="boot">running…</pre>
+
+    <script type="module">
+      /**
+       * 真实浏览器端到端验收（AC-01 ~ AC-20）
+       *
+       * 设计要点：
+       *   1. **不修改任何生产代码** —— 本页 fetch 真实 index.html 的 head/body 注入自身，
+       *      再动态 import 真实的 src/ui/main.js，并用真实 DOM 事件黑盒驱动。
+       *   2. **确定性** —— 必须在 import 应用模块之前接管 Math.random 与 Date.now：
+       *        · src/core/rng.js 在模块求值时执行 `export const defaultRng = Math.random`
+       *        · src/core/game.js 在构造时捕获默认参数 `now = Date.now`
+       *      接管之后，同一页面内可以跑任意多局可精确重放的确定性对局。
+       *   3. **每局重新播种** —— reseed(seed) 后点「重新开始」，该局 rng 即从种子重新开始。
+       *
+       * 由 tools/verify.mjs 用 headless 浏览器加载本页并解析 #e2e-report。
+       */
+      const results = [];
+      const record = (id, name, ok, detail = '') => results.push({ id, name, ok: !!ok, detail });
+      const errors = [];
+
+      window.addEventListener('error', (e) => errors.push(`error: ${e.message}`));
+      window.addEventListener('unhandledrejection', (e) => errors.push(`rejection: ${e.reason}`));
+
+      function assert(cond, msg) {
+        if (!cond) throw new Error(msg || '断言失败');
+      }
+
+      async function scenario(id, name, fn) {
+        try {
+          await fn();
+          record(id, name, true);
+        } catch (error) {
+          record(id, name, false, error?.message ?? String(error));
+        }
+      }
+
+      // ═════════════════════════════════════════════════════════
+      // 0 · 在 import 任何应用模块之前接管随机源与时钟
+      // ═════════════════════════════════════════════════════════
+      function mulberry32Local(seed) {
+        let a = seed >>> 0;
+        return function next() {
+          a = (a + 0x6d2b79f5) >>> 0;
+          let t = a;
+          t = Math.imul(t ^ (t >>> 15), t | 1);
+          t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+          return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+        };
+      }
+
+      let rngState = mulberry32Local(1);
+      Math.random = () => rngState();
+      const reseed = (seed) => {
+        rngState = mulberry32Local(seed);
+      };
+
+      let virtualNow = 1_700_000_000_000;
+      Date.now = () => virtualNow;
+      const advance = (ms) => {
+        virtualNow += ms;
+      };
+
+      // 现在才 import：上面的函数会被 rng.js 捕获为 defaultRng
+      const { mulberry32 } = await import('../src/core/rng.js');
+      const { createEmptyBoard, placeMines } = await import('../src/core/board.js');
+      const { DIFFICULTIES, STORAGE_KEYS } = await import('../src/core/constants.js');
+
+      // ═════════════════════════════════════════════════════════
+      // 1 · 注入真实页面的样式表与标记
+      // ═════════════════════════════════════════════════════════
+      const indexUrl = new URL('../index.html', location.href);
+      const html = await (await fetch(indexUrl)).text();
+      const parsed = new DOMParser().parseFromString(html, 'text/html');
+
+      for (const link of parsed.querySelectorAll('head link[rel="stylesheet"]')) {
+        const clone = link.cloneNode(true);
+        // href 必须相对 /index.html 解析；本页在 /tools/ 下，直接克隆会解析成 /tools/src/... → 404
+        clone.setAttribute('href', new URL(link.getAttribute('href'), indexUrl).href);
+        document.head.appendChild(clone);
+      }
+      document.body.innerHTML = parsed.body.innerHTML;
+
+      // 等样式表真正可用，否则 AC-18 / AC-19 读到的是无样式页面的计算值
+      await Promise.all(
+        [...document.querySelectorAll('head link[rel="stylesheet"]')].map(
+          (link) =>
+            new Promise((resolve) => {
+              if (link.sheet && link.sheet.cssRules.length > 0) resolve();
+              else {
+                link.addEventListener('load', resolve, { once: true });
+                link.addEventListener('error', resolve, { once: true });
+              }
+            }),
+        ),
+      );
+
+      // ═════════════════════════════════════════════════════════
+      // 2 · 工具函数
+      // ═════════════════════════════════════════════════════════
+      const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+      const $ = (id) => document.getElementById(id);
+      const allCells = () => [...document.querySelectorAll('#board .cell')];
+      const cellAt = (i) => document.querySelector(`#board .cell[data-index="${i}"]`);
+      const face = () => $('new-game').textContent;
+      const classOf = (i) => cellAt(i).classList;
+      const boardSig = () => allCells().map((c) => `${c.className}|${c.textContent}`).join(',');
+
+      // 真实浏览器里一次左键必然产生 pointerdown → pointerup → click，
+      // 如实模拟才能覆盖控制器里依赖 pointerdown 的状态（如抑制标记的复位）。
+      const pointer = (el, type, init) =>
+        el.dispatchEvent(new PointerEvent(type, { bubbles: true, cancelable: true, pointerType: 'mouse', ...init }));
+      const click = (el) => {
+        pointer(el, 'pointerdown', { button: 0, buttons: 1 });
+        pointer(el, 'pointerup', { button: 0, buttons: 0 });
+        el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, button: 0 }));
+      };
+      const rightClick = (el) => {
+        pointer(el, 'pointerdown', { button: 2, buttons: 2 });
+        pointer(el, 'pointerup', { button: 2, buttons: 0 });
+        el.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, button: 2 }));
+      };
+      const dblClick = (el) =>
+        el.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true, button: 0 }));
+      /** 裸 click：触屏长按后浏览器只补发 click，不会再发 pointerdown */
+      const bareClick = (el) =>
+        el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, button: 0 }));
+      /** 裸 contextmenu：触屏长按后浏览器合成的 contextmenu 前面没有 pointerdown */
+      const bareContextMenu = (el) =>
+        el.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, button: 2 }));
+      const key = (el, k) =>
+        (el ?? document).dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true }));
+
+      /** 只移动光标、不产生任何游戏动作的重绘触发器（用于读取纯时间驱动的显示） */
+      let probeIndex = 78;
+      function forceRedraw() {
+        probeIndex = probeIndex === 78 ? 77 : 78;
+        pointer(cellAt(probeIndex), 'pointerdown', { button: 0, buttons: 1 });
+        pointer(cellAt(probeIndex), 'pointerup', { button: 0, buttons: 0 });
+      }
+
+      // ═════════════════════════════════════════════════════════
+      // 3 · 游戏辅助
+      // ═════════════════════════════════════════════════════════
+      /** 开新局并让该局 rng 从种子重新开始，保证布局可被镜像重放 */
+      function newGame(seed, difficulty) {
+        reseed(seed);
+        if (difficulty) {
+          $('difficulty').value = difficulty;
+          $('difficulty').dispatchEvent(new Event('change', { bubbles: true }));
+        } else {
+          click($('new-game'));
+        }
+      }
+
+      /** 镜像重放：与 Game 内部完全相同的布雷过程（firstIndex 触发布雷） */
+      function layoutFor(seed, firstIndex, difficultyId) {
+        const d = DIFFICULTIES[difficultyId];
+        return placeMines(createEmptyBoard(d.width, d.height, d.mines), firstIndex, mulberry32(seed));
+      }
+
+      const safeIndices = (layout) => layout.cells.map((c, i) => (c.mine ? -1 : i)).filter((i) => i >= 0);
+      const mineIndices = (layout) => layout.cells.map((c, i) => (c.mine ? i : -1)).filter((i) => i >= 0);
+      const countRevealed = () => allCells().filter((c) => c.classList.contains('is-revealed')).length;
+
+      /** 该格的 8 邻域索引 */
+      function neighborsOf(index, width = 9, height = 9) {
+        const x = index % width;
+        const y = Math.floor(index / width);
+        const out = [];
+        for (let dx = -1; dx <= 1; dx += 1) {
+          for (let dy = -1; dy <= 1; dy += 1) {
+            if (dx === 0 && dy === 0) continue;
+            const nx = x + dx;
+            const ny = y + dy;
+            if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+            out.push(ny * width + nx);
+          }
+        }
+        return out;
+      }
+
+      /** 完全未标记：既没翻开，也不是旗标或问号 */
+      const isPlainHidden = (i) => {
+        const c = classOf(i);
+        return !c.contains('is-revealed') && !c.contains('is-flagged') && !c.contains('is-question');
+      };
+
+      /**
+       * 找一个"值得和弦"的已翻开数字格：它必须有至少一个仍未翻开的非雷邻域，
+       * 否则和弦本就无事可做，测不出任何东西。
+       */
+      function pickChordableCell(layout) {
+        return safeIndices(layout).find((k) => {
+          if (layout.cells[k].adjacent === 0) return false;
+          if (!classOf(k).contains('is-revealed')) return false;
+          return neighborsOf(k).some((n) => !layout.cells[n].mine && isPlainHidden(n));
+        });
+      }
+
+      /** 点遍所有安全格 → 干净取胜 */
+      function clickAllSafe(layout) {
+        for (const i of safeIndices(layout)) {
+          if (face() === '😎' || face() === '😵') break;
+          click(cellAt(i));
+        }
+      }
+
+      // ═════════════════════════════════════════════════════════
+      // 4 · 启动真实应用
+      // ═════════════════════════════════════════════════════════
+      try {
+        await import('../src/ui/main.js');
+      } catch (error) {
+        errors.push(`bootstrap: ${error?.message ?? error}`);
+      }
+      await sleep(50);
+
+      // ═════════════════════════════════════════════════════════
+      // SANITY · 镜像重放必须先成立，否则后续依赖布局的用例全部不可信
+      // ═════════════════════════════════════════════════════════
+      await scenario('SANITY', '确定性接管与镜像布局重放成立', async () => {
+        for (const seed of [1, 2, 3]) {
+          newGame(seed);
+          const layout = layoutFor(seed, 0, 'beginner');
+          click(cellAt(0));
+          const mine = mineIndices(layout)[0];
+          click(cellAt(mine));
+          assert(
+            classOf(mine).contains('is-exploded'),
+            `镜像失配（seed=${seed}）：索引 ${mine} 不是爆炸点 —— 随机源接管失败`,
+          );
+        }
+      });
+
+      // ═════════════════════════════════════════════════════════
+      // AC-01 三档难度与棋盘规格
+      // ═════════════════════════════════════════════════════════
+      await scenario('AC-01', '三档难度与棋盘规格 (REQ-F-001/002)', async () => {
+        newGame(10001, 'beginner');
+        assert(allCells().length === 81, `初级应有 81 格，实际 ${allCells().length}`);
+        assert($('mine-count').textContent === '010', `初级雷数应显示 010，实际 ${$('mine-count').textContent}`);
+
+        newGame(10001, 'intermediate');
+        assert(allCells().length === 256, `中级应有 256 格，实际 ${allCells().length}`);
+        assert($('mine-count').textContent === '040', '中级雷数应显示 040');
+
+        newGame(10001, 'expert');
+        assert(allCells().length === 480, `高级应有 480 格，实际 ${allCells().length}`);
+        assert($('mine-count').textContent === '099', '高级雷数应显示 099');
+        const rows = [...document.querySelectorAll('#board .board__row')];
+        assert(rows.length === 16, `高级应有 16 行，实际 ${rows.length}`);
+        assert(rows[0].children.length === 30, `高级每行应有 30 列，实际 ${rows[0].children.length}`);
+
+        // 切换难度必须立即开新局
+        assert(allCells().every((c) => !c.classList.contains('is-revealed')), '切换难度后应是全新棋盘');
+        assert($('timer').textContent === '000', '切换难度后计时应归零');
+        newGame(10001, 'beginner');
+        assert(allCells().length === 81);
+      });
+
+      // ═════════════════════════════════════════════════════════
+      // AC-02 重新开始
+      // ═════════════════════════════════════════════════════════
+      await scenario('AC-02', '重新开始清空棋盘 (REQ-F-003)', async () => {
+        newGame(101);
+        const layout = layoutFor(101, 0, 'beginner');
+        click(cellAt(0));
+        const hidden = safeIndices(layout).filter(isPlainHidden);
+        click(cellAt(hidden[0]));
+        rightClick(cellAt(hidden[hidden.length - 1]));
+        assert(countRevealed() > 0, '应有已翻开的格子');
+
+        click($('new-game'));
+        assert($('mine-count').textContent === '010', '重开后剩余雷数应回到 010');
+        assert($('timer').textContent === '000', '重开后计时应归零');
+        assert($('undo').disabled === true, '重开后撤销按钮应禁用');
+        assert(
+          allCells().every((c) => !c.classList.contains('is-revealed') && !c.classList.contains('is-flagged')),
+          '重开后所有格子应回到未翻开',
+        );
+      });
+
+      // ═════════════════════════════════════════════════════════
+      // AC-03 首点安全（并用"踩已知雷"反证镜像成立）
+      // ═════════════════════════════════════════════════════════
+      await scenario('AC-03', '首点及其邻域必定安全 (REQ-F-004/005/006)', async () => {
+        for (const [seed, first] of [
+          [201, 80],
+          [202, 0],
+          [203, 8],
+          [204, 72],
+          [206, 40],
+        ]) {
+          newGame(seed);
+          const layout = layoutFor(seed, first, 'beginner');
+          // 前提校验：镜像布局本身必须满足首点安全
+          assert(!layout.cells[first].mine, '镜像布局的首点不应是雷');
+          for (const n of neighborsOf(first)) {
+            assert(!layout.cells[n].mine, `镜像布局中首点邻域 ${n} 不应是雷`);
+          }
+
+          click(cellAt(first));
+          assert(classOf(first).contains('is-revealed'), `首点 ${first} 应被翻开`);
+          assert(!classOf(first).contains('is-exploded'), `首点 ${first} 不应踩雷`);
+          assert(face() === '🙂', `首点安全时不应结束对局，face=${face()}`);
+          // 进行中绝不得泄露雷的位置（REQ-F-006）
+          assert(!document.querySelector('.is-mine'), '进行中不得出现 is-mine 标记');
+        }
+
+        // 反证：点一个镜像算出的雷，若爆炸点索引一致，说明应用内部布局与镜像完全一致
+        newGame(205);
+        const layout = layoutFor(205, 0, 'beginner');
+        click(cellAt(0));
+        const mine = mineIndices(layout)[0];
+        click(cellAt(mine));
+        assert(classOf(mine).contains('is-exploded'), `索引 ${mine} 应是爆炸点`);
+        assert(face() === '😵', '踩雷后 face 应为 😵');
+      });
+
+      // ═════════════════════════════════════════════════════════
+      // AC-04 数字格翻开
+      // ═════════════════════════════════════════════════════════
+      await scenario('AC-04', '数字格翻开显示数字与配色类 (REQ-F-007)', async () => {
+        newGame(301);
+        const layout = layoutFor(301, 0, 'beginner');
+        click(cellAt(0));
+
+        const i = safeIndices(layout).find(
+          (k) => layout.cells[k].adjacent > 0 && classOf(k).contains('is-revealed'),
+        );
+        assert(i !== undefined, '首点展开后应存在已翻开的数字格');
+        const n = layout.cells[i].adjacent;
+        const el = cellAt(i);
+        assert(el.classList.contains('is-revealed'), '应标记为已翻开');
+        assert(el.textContent === String(n), `内容应为数字 ${n}，实际 "${el.textContent}"`);
+        assert(el.classList.contains(`n${n}`), `应带 n${n} 配色类，实际 class="${el.className}"`);
+        assert(/^rgb/.test(getComputedStyle(el).color), '数字应有实际颜色');
+        assert(!document.querySelector('.is-mine'), '进行中不得泄露雷');
+      });
+
+      // ═════════════════════════════════════════════════════════
+      // AC-05 零展开与旗标保护
+      // ═════════════════════════════════════════════════════════
+      await scenario('AC-05', '零展开且不翻开旗标格 (REQ-F-008~012)', async () => {
+        newGame(401);
+        const layout = layoutFor(401, 0, 'beginner');
+        click(cellAt(0));
+
+        const zero = safeIndices(layout).find((k) => layout.cells[k].adjacent === 0 && isPlainHidden(k));
+        assert(zero !== undefined, '应存在未翻开的 0 格');
+        const guard = neighborsOf(zero).find((n) => isPlainHidden(n));
+        assert(guard !== undefined, '0 格的邻域中应有未翻开的格子用于插旗');
+
+        rightClick(cellAt(guard)); // 插旗，把 guard 排除在展开之外
+        assert(classOf(guard).contains('is-flagged'), 'guard 应已插旗');
+        const before = countRevealed();
+        click(cellAt(zero));
+        const after = countRevealed();
+
+        assert(after > before, `0 格应触发连锁展开（${before} → ${after}）`);
+        assert(classOf(guard).contains('is-flagged'), '旗标格必须保持旗标');
+        assert(!classOf(guard).contains('is-revealed'), '旗标格绝不能被展开翻开');
+
+        // 问号格可被正常翻开且标记清除（REQ-F-011）
+        const q = safeIndices(layout).find((k) => isPlainHidden(k));
+        rightClick(cellAt(q));
+        rightClick(cellAt(q));
+        assert(classOf(q).contains('is-question'), '两次右键后应为问号');
+        click(cellAt(q));
+        assert(classOf(q).contains('is-revealed'), '问号格应能被翻开');
+        assert(!classOf(q).contains('is-question'), '问号标记应被清除');
+
+        // 点击已插旗的格子不得翻开（REQ-F-010）
+        const f = safeIndices(layout).find((k) => isPlainHidden(k));
+        assert(f !== undefined, '应存在完全未标记的格子');
+        rightClick(cellAt(f));
+        assert(classOf(f).contains('is-flagged'), '右键后应为旗标');
+        click(cellAt(f));
+        assert(classOf(f).contains('is-flagged'), '点击旗标格应被忽略');
+        assert(!classOf(f).contains('is-revealed'), '旗标格不得被翻开');
+      });
+
+      // ═════════════════════════════════════════════════════════
+      // AC-06 标记循环
+      // ═════════════════════════════════════════════════════════
+      await scenario('AC-06', '右键标记循环 旗→问号→空 (REQ-F-013~016)', async () => {
+        newGame(501);
+        const layout = layoutFor(501, 0, 'beginner');
+        click(cellAt(0));
+        const t = safeIndices(layout).find((k) => isPlainHidden(k));
+        const el = cellAt(t);
+
+        rightClick(el);
+        assert(el.classList.contains('is-flagged') && el.textContent === '🚩', `第 1 次右键应为旗标，实际 "${el.textContent}"`);
+        rightClick(el);
+        assert(el.classList.contains('is-question') && el.textContent === '?', `第 2 次右键应为问号，实际 "${el.textContent}"`);
+        rightClick(el);
+        assert(isPlainHidden(t), '第 3 次右键应回到未翻开');
+
+        // 已翻开格拒绝标记（REQ-F-016）
+        const revealed = allCells().find((c) => c.classList.contains('is-revealed'));
+        const sig = revealed.className + revealed.textContent;
+        rightClick(revealed);
+        assert(revealed.className + revealed.textContent === sig, '已翻开格右键不应有任何变化');
+      });
+
+      // ═════════════════════════════════════════════════════════
+      // AC-07 剩余雷数（含负值）
+      // ═════════════════════════════════════════════════════════
+      await scenario('AC-07', '剩余雷数允许为负 (REQ-F-017)', async () => {
+        newGame(601);
+        const layout = layoutFor(601, 0, 'beginner');
+        click(cellAt(0));
+
+        const targets = safeIndices(layout).filter(isPlainHidden).slice(0, 11);
+        assert(targets.length === 11, `应有 11 个未标记格可用，实际 ${targets.length}`);
+        for (const t of targets) rightClick(cellAt(t));
+        assert($('mine-count').textContent === '-01', `插 11 面旗后应显示 -01，实际 ${$('mine-count').textContent}`);
+
+        // 旗 → 问号：旗标数减 1，剩余雷数回到 0
+        rightClick(cellAt(targets[0]));
+        assert(classOf(targets[0]).contains('is-question'), '第 2 次右键应为问号');
+        assert($('mine-count').textContent === '000', `旗标变问号后应显示 000，实际 ${$('mine-count').textContent}`);
+
+        // 问号 → 空白：旗标数不变
+        rightClick(cellAt(targets[0]));
+        assert(isPlainHidden(targets[0]), '第 3 次右键应回到未翻开');
+        assert($('mine-count').textContent === '000', '问号变空白后旗标数不变，仍应显示 000');
+      });
+
+      // ═════════════════════════════════════════════════════════
+      // AC-08 和弦的三种触发
+      // ═════════════════════════════════════════════════════════
+      await scenario('AC-08', '和弦三种触发方式 (REQ-F-018~021)', async () => {
+        // 构造：翻开一个"值得和弦"的数字格，给它邻域内所有的雷插旗 → 旗标数 == 数字
+        function setupChord(seeds) {
+          for (const seed of seeds) {
+            newGame(seed);
+            const layout = layoutFor(seed, 0, 'beginner');
+            click(cellAt(0));
+            const numberCell = pickChordableCell(layout);
+            if (numberCell === undefined) continue; // 该种子下没有可和弦的数字格，换一个
+            for (const n of neighborsOf(numberCell)) {
+              if (layout.cells[n].mine) rightClick(cellAt(n));
+            }
+            assert(classOf(numberCell).contains('is-revealed'), '和弦目标格本身应已翻开');
+            return { layout, numberCell };
+          }
+          throw new Error(`种子 ${seeds.join('/')} 下都找不到邻域仍有未翻开安全格的数字格`);
+        }
+
+        // 触发一：双击
+        {
+          const { numberCell } = setupChord([701, 711, 721, 731, 741]);
+          const before = countRevealed();
+          dblClick(cellAt(numberCell));
+          assert(countRevealed() > before, `双击应触发展开（${before} → ${countRevealed()}）`);
+          assert(face() === '🙂', '旗标正确时和弦不应判负');
+        }
+
+        // 触发二：左右键同按
+        {
+          const { numberCell } = setupChord([702, 712, 722, 732, 742]);
+          const before = countRevealed();
+          pointer(cellAt(numberCell), 'pointerdown', { button: 0, buttons: 3 });
+          pointer(cellAt(numberCell), 'pointerup', { button: 0, buttons: 0 });
+          bareClick(cellAt(numberCell)); // 真实鼠标和弦后浏览器补发的那次 click
+          assert(countRevealed() > before, `左右同按应触发展开（${before} → ${countRevealed()}）`);
+        }
+
+        // 触发三：键盘 Enter 作用于已翻开格
+        {
+          const { numberCell } = setupChord([703, 713, 723, 733, 743]);
+          const before = countRevealed();
+          cellAt(numberCell).focus();
+          key(cellAt(numberCell), 'Enter');
+          assert(countRevealed() > before, `Enter 应触发展开（${before} → ${countRevealed()}）`);
+        }
+
+        // 旗标数不匹配 → 三种方式都不应有反应（REQ-F-020）
+        {
+          newGame(704);
+          const layout = layoutFor(704, 0, 'beginner');
+          click(cellAt(0));
+          const numberCell = pickChordableCell(layout);
+          assert(numberCell !== undefined, '应存在一个可和弦的数字格');
+          const before = countRevealed();
+          dblClick(cellAt(numberCell));
+          pointer(cellAt(numberCell), 'pointerdown', { button: 0, buttons: 3 });
+          pointer(cellAt(numberCell), 'pointerup', { button: 0, buttons: 0 });
+          bareClick(cellAt(numberCell));
+          cellAt(numberCell).focus();
+          key(cellAt(numberCell), 'Enter');
+          assert(countRevealed() === before, '旗标数不等于数字时，和弦必须无效');
+          assert(face() === '🙂', '无效和弦不应结束对局');
+        }
+      });
+
+      // ═════════════════════════════════════════════════════════
+      // AC-09 失败结算与揭示
+      // ═════════════════════════════════════════════════════════
+      await scenario('AC-09', '失败结算：爆炸点/亮雷/错误旗标/锁定 (REQ-F-024/025)', async () => {
+        newGame(801);
+        const layout = layoutFor(801, 0, 'beginner');
+        click(cellAt(0));
+
+        const wrong = safeIndices(layout).find((k) => isPlainHidden(k));
+        rightClick(cellAt(wrong)); // 在非雷格上故意插错旗
+
+        const mine = mineIndices(layout)[0];
+        click(cellAt(mine));
+
+        assert(face() === '😵', `失败后 face 应为 😵，实际 ${face()}`);
+        assert(classOf(mine).contains('is-exploded'), '踩中的雷应高亮为爆炸点');
+        assert(classOf(wrong).contains('is-wrong'), '错误旗标应显示叉号');
+        assert(cellAt(wrong).textContent === '✕', `错误旗标内容应为 ✕，实际 "${cellAt(wrong).textContent}"`);
+
+        // 所有未被旗标标出的雷都必须亮出（爆炸点用 is-exploded 而非 is-mine）
+        const totalMines = layout.cells.filter((c) => c.mine).length;
+        const shownMines = mineIndices(layout).filter(
+          (m) => classOf(m).contains('is-mine') || classOf(m).contains('is-exploded'),
+        );
+        assert(shownMines.length === totalMines, `所有未插旗的雷都应亮出，实际 ${shownMines.length}/${totalMines}`);
+
+        // 终局锁定（REQ-F-025）
+        assert($('undo').disabled === true, '失败后撤销按钮应禁用');
+        assert($('hint').disabled === true, '失败后提示按钮应禁用');
+        const sig = boardSig();
+        click(cellAt(safeIndices(layout).find((k) => isPlainHidden(k)) ?? 0));
+        rightClick(cellAt(1));
+        dblClick(cellAt(2));
+        key(document.body, 'u');
+        key(document.body, 'h');
+        assert(boardSig() === sig, '终局后任何操作都不得改变棋盘');
+      });
+
+      // ═════════════════════════════════════════════════════════
+      // AC-10 胜利结算与锁定
+      // ═════════════════════════════════════════════════════════
+      await scenario('AC-10', '胜利结算：自动补旗 + 锁定 (REQ-F-022/023/025)', async () => {
+        newGame(901);
+        const layout = layoutFor(901, 0, 'beginner');
+        click(cellAt(0));
+        clickAllSafe(layout);
+
+        assert(face() === '😎', `清空非雷格后应胜利，face=${face()}`);
+        assert($('mine-count').textContent === '000', '胜利后剩余雷数应为 000');
+        const flags = allCells().filter((c) => c.classList.contains('is-flagged')).length;
+        assert(flags === 10, `未插旗的雷应被自动补旗，实际 ${flags} 面旗`);
+        assert(cellAt(mineIndices(layout)[0]).textContent === '🚩', '雷格应显示为旗标');
+        const leftover = allCells().filter(
+          (c, i) => !layout.cells[i].mine && !c.classList.contains('is-revealed'),
+        ).length;
+        assert(leftover === 0, `不应再有未翻开的非雷格，实际剩 ${leftover}`);
+
+        const sig = boardSig();
+        click(cellAt(mineIndices(layout)[1]));
+        key(document.body, 'u');
+        assert(boardSig() === sig, '胜利后棋盘应锁定');
+      });
+
+      // ═════════════════════════════════════════════════════════
+      // AC-11 计时器与状态栏
+      // ═════════════════════════════════════════════════════════
+      await scenario('AC-11', '计时器：插旗不启动、首翻启动、3 位零填充 (REQ-F-026~030)', async () => {
+        newGame(1001);
+        const layout = layoutFor(1001, 0, 'beginner');
+
+        // 计时由 Game 按时间戳差值计算，HUD 由 250ms 轮询刷新。
+        // headless 的 --virtual-time-budget 下轮询调度可能与真实浏览器不同，
+        // 因此记录"仅靠轮询是否已刷新"，并用 forceRedraw 兜底读取，
+        // 既不把环境差异误报成缺陷，也不掩盖真实缺陷。
+        let pollOnlyOk = true;
+        const readTimer = async () => {
+          const polled = $('timer').textContent;
+          forceRedraw();
+          const forced = $('timer').textContent;
+          if (polled !== forced) pollOnlyOk = false;
+          return forced;
+        };
+
+        advance(5000);
+        await sleep(400);
+        assert((await readTimer()) === '000', 'READY 状态计时应为 000');
+
+        // 只插旗，不翻开（REQ-F-027）。
+        // 注意必须避开索引 0：稍后要用 cellAt(0) 触发首点，
+        // 若把 0 号格插了旗，那次翻开会被 REQ-F-010 正确忽略，计时就永远不会启动。
+        const flagTarget = safeIndices(layout).find((k) => k !== 0 && isPlainHidden(k));
+        assert(flagTarget !== undefined, '应存在 0 号以外的未标记格');
+        rightClick(cellAt(flagTarget));
+        assert(classOf(flagTarget).contains('is-flagged'), '旗标应已插上（否则本用例前提不成立）');
+        advance(5000);
+        await sleep(400);
+        assert((await readTimer()) === '000', '仅插旗不得启动计时');
+
+        // 首次翻开
+        click(cellAt(0));
+        advance(3000);
+        await sleep(400);
+        assert((await readTimer()) === '003', `首翻后 3 秒应显示 003，实际 ${$('timer').textContent}`);
+
+        advance(9000);
+        await sleep(400);
+        assert((await readTimer()) === '012', `再过 9 秒应显示 012，实际 ${$('timer').textContent}`);
+
+        // 状态栏元素齐全（REQ-F-030）
+        for (const id of ['mine-count', 'timer', 'best-time', 'new-game', 'undo', 'hint', 'theme', 'flag-mode', 'difficulty', 'message']) {
+          assert($(id) !== null, `状态栏应包含 #${id}`);
+        }
+
+        // 999 钳制（REQ-F-028）
+        advance(2_000_000);
+        await sleep(400);
+        assert((await readTimer()) === '999', `超过 999 秒应钳制为 999，实际 ${$('timer').textContent}`);
+
+        record(
+          'AC-11-info',
+          '计时刷新方式',
+          true,
+          pollOnlyOk ? '250ms 轮询即可刷新' : '虚拟时间下轮询未自动生效，已用显式重绘读取',
+        );
+      });
+
+      // ═════════════════════════════════════════════════════════
+      // AC-12 撤销
+      // ═════════════════════════════════════════════════════════
+      await scenario('AC-12', '撤销精确复原且计时不回退 (REQ-F-031~036)', async () => {
+        newGame(1101);
+        const layout = layoutFor(1101, 0, 'beginner');
+        click(cellAt(0));
+
+        const s0 = boardSig();
+        advance(2000);
+        await sleep(300);
+
+        const t1 = safeIndices(layout).find((k) => isPlainHidden(k));
+        rightClick(cellAt(t1));
+        const s1 = boardSig();
+        const t2 = safeIndices(layout).find((k) => k !== t1 && isPlainHidden(k) && layout.cells[k].adjacent > 0);
+        assert(t2 !== undefined, '应存在可翻开的数字格');
+        click(cellAt(t2));
+        const s2 = boardSig();
+        assert(s2 !== s1 && s1 !== s0, '各步中间态应彼此不同');
+
+        advance(4000);
+        await sleep(300);
+        forceRedraw();
+        const timerBeforeUndo = $('timer').textContent;
+
+        click($('undo'));
+        assert(boardSig() === s1, '第 1 次撤销应精确回到 s1');
+        forceRedraw();
+        assert(
+          Number($('timer').textContent) >= Number(timerBeforeUndo),
+          `撤销后计时不得回退（撤销前 ${timerBeforeUndo}，撤销后 ${$('timer').textContent}）`,
+        );
+
+        click($('undo'));
+        assert(boardSig() === s0, '第 2 次撤销应精确回到 s0');
+
+        // 一路退到开局
+        let guard = 0;
+        while (!$('undo').disabled && guard < 200) {
+          click($('undo'));
+          guard += 1;
+        }
+        assert($('undo').disabled === true, '撤销栈清空后按钮应禁用');
+        click($('undo'));
+        assert($('undo').disabled === true, '空栈时撤销应无副作用');
+        assert(allCells().every((c) => !c.classList.contains('is-revealed')), '退到开局后棋盘应全空');
+
+        // 撤回 READY 后再次首点，安全保证仍成立（REQ-F-004 与撤销的交互）
+        click(cellAt(40));
+        assert(classOf(40).contains('is-revealed'), '撤回 READY 后再次首点应能翻开');
+        assert(face() === '🙂', '再次首点仍须安全');
+      });
+
+      // ═════════════════════════════════════════════════════════
+      // AC-13 提示
+      // ═════════════════════════════════════════════════════════
+      await scenario('AC-13', '提示只翻安全格且不限次数 (REQ-F-037~040)', async () => {
+        newGame(1201);
+        const layout = layoutFor(1201, 0, 'beginner');
+        click(cellAt(0)); // 先确定布局，之后 hint 才不会打乱镜像
+
+        let previous = countRevealed();
+        for (let round = 0; round < 8; round += 1) {
+          assert($('hint').disabled === false, '提示按钮应始终可用（不限次数）');
+          click($('hint'));
+          const now = countRevealed();
+          assert(now > previous, `第 ${round + 1} 次提示应至少多翻开一格（${previous} → ${now}）`);
+          previous = now;
+        }
+
+        // 所有已翻开的格都必须是安全格
+        allCells().forEach((el, i) => {
+          if (el.classList.contains('is-revealed')) {
+            assert(!layout.cells[i].mine, `已翻开的格 ${i} 不应是雷`);
+          }
+        });
+        assert(face() === '🙂', '提示绝不应踩雷');
+        assert(!document.querySelector('.is-exploded'), '不应出现爆炸点');
+
+        // 提示可被撤销
+        const sig = boardSig();
+        click($('hint'));
+        assert(boardSig() !== sig, '提示应改变棋盘');
+        click($('undo'));
+        assert(boardSig() === sig, '撤销应回退掉提示的效果');
+
+        // 用提示推进到胜利后，不得记入最佳成绩（REQ-F-043）
+        const before = localStorage.getItem(STORAGE_KEYS.bestTimes);
+        clickAllSafe(layout);
+        assert(face() === '😎', '补完剩余安全格后应取胜');
+        assert(localStorage.getItem(STORAGE_KEYS.bestTimes) === before, '用过提示的胜利不得写入最佳成绩');
+      });
+
+      // ═════════════════════════════════════════════════════════
+      // AC-14 最佳成绩与成绩有效性
+      // ═════════════════════════════════════════════════════════
+      await scenario('AC-14', '最佳成绩只在干净局且更快时写入 (REQ-F-041~045)', async () => {
+        newGame(10001, 'beginner');
+        localStorage.removeItem(STORAGE_KEYS.bestTimes);
+        newGame(10002, 'beginner');
+        assert($('best-time').textContent === '--', `清空后应显示 --，实际 ${$('best-time').textContent}`);
+
+        // 第 1 局：干净取胜，用时 20 秒
+        newGame(1301);
+        let layout = layoutFor(1301, 0, 'beginner');
+        click(cellAt(0));
+        advance(20_000);
+        await sleep(300);
+        clickAllSafe(layout);
+        assert(face() === '😎', `第 1 局应取胜，face=${face()}`);
+        forceRedraw();
+        assert($('timer').textContent === '020', `胜利时应冻结在 020，实际 ${$('timer').textContent}`);
+        const stored = JSON.parse(localStorage.getItem(STORAGE_KEYS.bestTimes));
+        assert(stored.beginner === 20, `应记录 beginner=20，实际 ${JSON.stringify(stored)}`);
+        assert($('best-time').textContent === '20', `最佳成绩应显示 20，实际 ${$('best-time').textContent}`);
+
+        // 第 2 局：更慢的干净局（50 秒）不得覆盖
+        newGame(1302);
+        layout = layoutFor(1302, 0, 'beginner');
+        click(cellAt(0));
+        advance(50_000);
+        await sleep(300);
+        clickAllSafe(layout);
+        assert(face() === '😎', '第 2 局应取胜');
+        assert(JSON.parse(localStorage.getItem(STORAGE_KEYS.bestTimes)).beginner === 20, '更慢的成绩不得覆盖');
+
+        // 第 3 局：用过撤销的局（5 秒）不得写入
+        newGame(1303);
+        layout = layoutFor(1303, 0, 'beginner');
+        click(cellAt(0));
+        rightClick(cellAt(safeIndices(layout).find((k) => isPlainHidden(k))));
+        click($('undo')); // 置 dirty
+        advance(5_000);
+        await sleep(300);
+        clickAllSafe(layout);
+        assert(face() === '😎', '第 3 局应取胜');
+        const after = JSON.parse(localStorage.getItem(STORAGE_KEYS.bestTimes));
+        assert(after.beginner === 20, `用过撤销的局不得写入成绩，实际 ${JSON.stringify(after)}`);
+
+        // 第 4 局：更快且干净（10 秒）应刷新
+        newGame(1304);
+        layout = layoutFor(1304, 0, 'beginner');
+        click(cellAt(0));
+        advance(10_000);
+        await sleep(300);
+        clickAllSafe(layout);
+        assert(face() === '😎', '第 4 局应取胜');
+        assert(JSON.parse(localStorage.getItem(STORAGE_KEYS.bestTimes)).beginner === 10, '更快且干净的成绩应刷新记录');
+        assert($('message').textContent.includes('新纪录'), `刷新记录时应有新纪录提示，实际 "${$('message').textContent}"`);
+
+        // 各难度成绩隔离（REQ-F-044）
+        assert($('best-time').textContent === '10');
+        newGame(10003, 'expert');
+        assert($('best-time').textContent === '--', '高级无记录时应显示 --');
+        newGame(10003, 'beginner');
+
+        // 存储不可用时页面不得报错（REQ-F-045）
+        assert(errors.length === 0, `控制台不应有错误：${errors.join('; ')}`);
+      });
+
+      // ═════════════════════════════════════════════════════════
+      // AC-15 键盘操作
+      // ═════════════════════════════════════════════════════════
+      await scenario('AC-15', '键盘操作与边界 (REQ-F-046~049)', async () => {
+        newGame(1401);
+        const layout = layoutFor(1401, 0, 'beginner');
+
+        // 方向键移动
+        cellAt(0).focus();
+        key(cellAt(0), 'ArrowRight');
+        assert(document.activeElement === cellAt(1), `ArrowRight 应移到索引 1，实际 ${document.activeElement?.dataset?.index}`);
+        key(cellAt(1), 'ArrowDown');
+        assert(document.activeElement === cellAt(10), 'ArrowDown 应下移一行（+9）');
+        key(cellAt(10), 'ArrowLeft');
+        assert(document.activeElement === cellAt(9), 'ArrowLeft 应左移');
+        key(cellAt(9), 'ArrowUp');
+        assert(document.activeElement === cellAt(0), 'ArrowUp 应上移一行（-9）');
+
+        // 边界不环绕（REQ-F-046）
+        cellAt(8).focus();
+        key(cellAt(8), 'ArrowRight');
+        assert(document.activeElement === cellAt(8), '最右列继续右移应停在原地，不得环绕到下一行');
+        cellAt(0).focus();
+        key(cellAt(0), 'ArrowLeft');
+        assert(document.activeElement === cellAt(0), '最左列继续左移应停在原地');
+        cellAt(72).focus();
+        key(cellAt(72), 'ArrowDown');
+        assert(document.activeElement === cellAt(72), '最底行继续下移应停在原地');
+
+        // Enter 翻开（REQ-F-047）
+        const target = safeIndices(layout).find((k) => layout.cells[k].adjacent > 0);
+        cellAt(target).focus();
+        key(cellAt(target), 'Enter');
+        assert(classOf(target).contains('is-revealed'), 'Enter 应翻开焦点格');
+
+        // Space 同样可翻开
+        const spaceTarget = safeIndices(layout).find((k) => isPlainHidden(k) && layout.cells[k].adjacent > 0);
+        if (spaceTarget !== undefined) {
+          cellAt(spaceTarget).focus();
+          key(cellAt(spaceTarget), ' ');
+          assert(classOf(spaceTarget).contains('is-revealed'), 'Space 应翻开焦点格');
+        }
+
+        // F 标记循环（REQ-F-048）
+        const fTarget = safeIndices(layout).find((k) => isPlainHidden(k));
+        cellAt(fTarget).focus();
+        key(cellAt(fTarget), 'f');
+        assert(classOf(fTarget).contains('is-flagged'), 'F 应插旗');
+        key(cellAt(fTarget), 'f');
+        assert(classOf(fTarget).contains('is-question'), '再按 F 应变问号');
+        key(cellAt(fTarget), 'f');
+        assert(isPlainHidden(fTarget), '第三次按 F 应回到未翻开');
+
+        // 全局快捷键（REQ-F-049）
+        const beforeHint = countRevealed();
+        key(document.body, 'h');
+        assert(countRevealed() > beforeHint, 'H 应触发提示');
+        key(document.body, 'u');
+        assert(countRevealed() === beforeHint, 'U 应撤销提示');
+
+        key(document.body, 'r');
+        assert($('timer').textContent === '000', 'R 应重开并归零计时');
+        assert(allCells().every((c) => !c.classList.contains('is-revealed')), 'R 应清空棋盘');
+
+        // 大小写均有效
+        click(cellAt(0));
+        const afterUpperH = countRevealed();
+        key(document.body, 'H');
+        assert(countRevealed() > afterUpperH, '大写 H 同样有效');
+      });
+
+      // ═════════════════════════════════════════════════════════
+      // AC-16 无障碍语义
+      // ═════════════════════════════════════════════════════════
+      await scenario('AC-16', '网格语义 / roving tabindex / aria-label (REQ-F-050~052)', async () => {
+        newGame(1501);
+        const layout = layoutFor(1501, 0, 'beginner');
+        click(cellAt(0));
+
+        assert($('board').getAttribute('role') === 'grid', '棋盘应为 role=grid');
+        assert(document.querySelectorAll('#board [role="row"]').length === 9, '应有 9 个 role=row');
+        assert(document.querySelectorAll('#board [role="gridcell"]').length === 81, '应有 81 个 role=gridcell');
+        assert(
+          document.querySelectorAll('#board .cell[tabindex="0"]').length === 1,
+          `roving tabindex 必须恰好为 1，实际 ${document.querySelectorAll('#board .cell[tabindex="0"]').length}`,
+        );
+
+        // aria-label 格式（REQ-F-050）
+        assert(
+          cellAt(0).getAttribute('aria-label').startsWith('第 1 行第 1 列，'),
+          `首格标签：${cellAt(0).getAttribute('aria-label')}`,
+        );
+        const revealedIndex = safeIndices(layout).find((k) => classOf(k).contains('is-revealed'));
+        const label = cellAt(revealedIndex).getAttribute('aria-label');
+        assert(/^第 \d+ 行第 \d+ 列，/.test(label), `标签格式应为「第 N 行第 M 列，…」，实际 "${label}"`);
+        assert(/已翻开/.test(label), `已翻开格的标签应说明状态，实际 "${label}"`);
+
+        // 标记后标签同步更新
+        const markTarget = safeIndices(layout).find((k) => isPlainHidden(k));
+        rightClick(cellAt(markTarget));
+        assert(
+          cellAt(markTarget).getAttribute('aria-label').endsWith('已插旗'),
+          `插旗后标签：${cellAt(markTarget).getAttribute('aria-label')}`,
+        );
+
+        // 焦点移动后 tabindex 唯一性不变（REQ-F-051）
+        cellAt(0).focus();
+        key(cellAt(0), 'ArrowRight');
+        assert(document.querySelectorAll('#board .cell[tabindex="0"]').length === 1, '移动焦点后 tabindex 仍须唯一');
+        assert(cellAt(1).getAttribute('tabindex') === '0' && cellAt(0).getAttribute('tabindex') === '-1', 'tabindex 应跟随焦点');
+
+        // live 区域语义（REQ-F-052）
+        assert($('mine-count').getAttribute('role') === 'status', '剩余雷数应为 role=status');
+        assert($('mine-count').getAttribute('aria-live') === 'polite', '剩余雷数应为 aria-live=polite');
+        assert($('timer').getAttribute('role') === 'timer', '计时器应为 role=timer');
+        assert($('timer').closest('[aria-live]') === null, '计时器不得处于 aria-live 区域内');
+
+        // 高级棋盘的行列换算
+        newGame(1502, 'expert');
+        const last = allCells().length - 1;
+        assert(
+          cellAt(last).getAttribute('aria-label').startsWith('第 16 行第 30 列'),
+          `专家末格标签：${cellAt(last).getAttribute('aria-label')}`,
+        );
+        newGame(1501, 'beginner');
+      });
+
+      // ═════════════════════════════════════════════════════════
+      // AC-17 触控适配
+      // ═════════════════════════════════════════════════════════
+      await scenario('AC-17', '触控长按插旗与旗标模式 (REQ-F-053/054/056)', async () => {
+        newGame(1601);
+        const layout = layoutFor(1601, 0, 'beginner');
+        click(cellAt(0));
+
+        // 长按 500ms → 插旗，且不得翻开
+        const t = safeIndices(layout).find((k) => isPlainHidden(k));
+        const el = cellAt(t);
+        pointer(el, 'pointerdown', { pointerType: 'touch', button: 0, buttons: 1 });
+        await sleep(600);
+        assert(el.classList.contains('is-flagged'), '长按应插旗');
+        assert(!el.classList.contains('is-revealed'), '长按不得翻开格子');
+
+        pointer(el, 'pointerup', { pointerType: 'touch', button: 0, buttons: 0 });
+        bareClick(el);
+        assert(el.classList.contains('is-flagged'), '长按后紧随的 click 必须被吞掉（不得再标记或翻开）');
+
+        // 浏览器在长按后可能补发 contextmenu（且前面没有 pointerdown）—— 必须被吞掉
+        bareContextMenu(el);
+        assert(el.classList.contains('is-flagged'), '长按后的 contextmenu 必须被吞掉，格子应仍为旗标');
+        assert(!el.classList.contains('is-question'), '不得因为补发的 contextmenu 变成问号');
+
+        // 短按（未达 500ms）应翻开而不是插旗
+        const t2 = safeIndices(layout).find((k) => isPlainHidden(k));
+        pointer(cellAt(t2), 'pointerdown', { pointerType: 'touch', button: 0, buttons: 1 });
+        await sleep(120);
+        pointer(cellAt(t2), 'pointerup', { pointerType: 'touch', button: 0, buttons: 0 });
+        bareClick(cellAt(t2));
+        assert(!cellAt(t2).classList.contains('is-flagged'), '短按不应插旗');
+        assert(cellAt(t2).classList.contains('is-revealed'), '短按应是翻开');
+
+        // 旗标模式（REQ-F-056）
+        click($('flag-mode'));
+        assert($('flag-mode').getAttribute('aria-pressed') === 'true', '旗标模式按钮应反映开启状态');
+        const t3 = safeIndices(layout).find((k) => isPlainHidden(k));
+        click(cellAt(t3));
+        assert(classOf(t3).contains('is-flagged'), '旗标模式下单击应插旗');
+        assert(!classOf(t3).contains('is-revealed'), '旗标模式下单击不得翻开');
+        click(cellAt(t3));
+        assert(classOf(t3).contains('is-question'), '旗标模式下再次单击应为问号');
+
+        click($('flag-mode'));
+        assert($('flag-mode').getAttribute('aria-pressed') === 'false', '关闭旗标模式后 aria-pressed 应为 false');
+        click(cellAt(t3));
+        assert(classOf(t3).contains('is-revealed'), '关闭旗标模式后单击应正常翻开');
+
+        // 长按不得选中文本（REQ-F-054 的 CSS 部分）
+        const style = getComputedStyle(document.body);
+        const userSelect = style.userSelect || style.webkitUserSelect;
+        assert(userSelect === 'none', `body 应禁止选中文本，实际 user-select: ${userSelect}`);
+      });
+
+      // ═════════════════════════════════════════════════════════
+      // AC-18 响应式布局
+      // ═════════════════════════════════════════════════════════
+      await scenario('AC-18', '响应式：无横向滚动条 (REQ-F-055)', async () => {
+        const vw = window.innerWidth;
+        assert(vw > 0, '视口宽度应可用');
+
+        const sizes = {};
+        for (const id of ['beginner', 'intermediate', 'expert']) {
+          newGame(1701, id);
+          await sleep(20);
+          const board = $('board');
+          const boardWidth = board.getBoundingClientRect().width;
+          assert(
+            document.documentElement.scrollWidth <= vw + 1,
+            `${id}：页面不得出现横向滚动（scrollWidth=${document.documentElement.scrollWidth}, vw=${vw}）`,
+          );
+          assert(boardWidth <= vw + 1, `${id}：棋盘宽度 ${boardWidth.toFixed(1)} 不得超过视口 ${vw}`);
+
+          // 关键断言：一行单元格的总宽必须等于棋盘的内容宽度。
+          // 若 --cell-size 公式偏大，max-width:100% 会把棋盘钳窄、overflow:hidden 静默裁掉最后一列，
+          // 此时 boardWidth <= vw 依然成立（上面那条测不出来），但两者会不相等。
+          const rowWidth = [...board.querySelector('.board__row').children].reduce(
+            (sum, cell) => sum + cell.getBoundingClientRect().width,
+            0,
+          );
+          assert(
+            Math.abs(rowWidth - board.clientWidth) <= 1,
+            `${id}：一行单元格总宽 ${rowWidth.toFixed(2)} 应等于棋盘内容宽度 ${board.clientWidth}（不等说明被裁切或溢出）`,
+          );
+
+          sizes[id] = parseFloat(getComputedStyle(cellAt(0)).width);
+          assert(sizes[id] > 0, `${id}：单元格应有正的尺寸`);
+        }
+
+        assert(sizes.expert <= sizes.beginner, `专家格（${sizes.expert}）不应大于初级格（${sizes.beginner}）`);
+        record(
+          'AC-18-info',
+          '实测单元格尺寸',
+          true,
+          `视口 ${vw}px → 初级 ${sizes.beginner.toFixed(1)}px / 中级 ${sizes.intermediate.toFixed(1)}px / 高级 ${sizes.expert.toFixed(1)}px`,
+        );
+
+        newGame(1702, 'beginner');
+      });
+
+      // ═════════════════════════════════════════════════════════
+      // AC-19 深浅主题与对比度
+      // ═════════════════════════════════════════════════════════
+      await scenario('AC-19', '主题切换、持久化与数字对比度 (REQ-F-057~060)', async () => {
+        const root = document.documentElement;
+
+        // 用一个临时元素把任意颜色写法正规化为 rgb()，再算 WCAG 对比度
+        const probe = document.createElement('span');
+        document.body.appendChild(probe);
+        const toRgb = (value) => {
+          probe.style.color = '';
+          probe.style.color = value;
+          const resolved = getComputedStyle(probe).color;
+          const m = resolved.match(/(\d+(?:\.\d+)?)/g);
+          assert(m && m.length >= 3, `无法解析颜色：${value} → ${resolved}`);
+          return m.slice(0, 3).map(Number);
+        };
+        const lum = ([r, g, b]) => {
+          const f = (c) => {
+            const s = c / 255;
+            return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
+          };
+          return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b);
+        };
+        const contrast = (a, b) => {
+          const la = lum(toRgb(a));
+          const lb = lum(toRgb(b));
+          return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
+        };
+
+        const initial = root.getAttribute('data-theme');
+        assert(initial === 'light' || initial === 'dark', `data-theme 应为 light/dark，实际 ${initial}`);
+
+        const worst = {};
+        for (const theme of ['light', 'dark']) {
+          if (root.getAttribute('data-theme') !== theme) {
+            click($('theme'));
+            assert(root.getAttribute('data-theme') === theme, `切换后应为 ${theme}`);
+          }
+          const styles = getComputedStyle(root);
+          const cellBg = styles.getPropertyValue('--cell-revealed').trim();
+          assert(cellBg !== '', `主题 ${theme} 应定义 --cell-revealed（样式表未生效？）`);
+          worst[theme] = Infinity;
+          for (let n = 1; n <= 8; n += 1) {
+            const color = styles.getPropertyValue(`--n${n}`).trim();
+            assert(color !== '', `主题 ${theme} 应定义 --n${n}`);
+            const ratio = contrast(color, cellBg);
+            worst[theme] = Math.min(worst[theme], ratio);
+            assert(
+              ratio >= 4.5,
+              `主题 ${theme} 的数字 ${n} 对比度 ${ratio.toFixed(2)}:1 低于 4.5:1（${color} on ${cellBg}）`,
+            );
+          }
+        }
+
+        // 持久化（REQ-F-059）
+        assert(
+          localStorage.getItem(STORAGE_KEYS.theme) === root.getAttribute('data-theme'),
+          `主题选择应持久化，实际 ${localStorage.getItem(STORAGE_KEYS.theme)}`,
+        );
+
+        record(
+          'AC-19-info',
+          '数字最差对比度',
+          true,
+          `浅色 ${worst.light.toFixed(2)}:1，深色 ${worst.dark.toFixed(2)}:1（阈值 4.5:1）`,
+        );
+
+        // 切回浅色，避免影响后续
+        if (root.getAttribute('data-theme') === 'dark') click($('theme'));
+        probe.remove();
+      });
+
+      // ═════════════════════════════════════════════════════════
+      // AC-20 离线 / 性能
+      // ═════════════════════════════════════════════════════════
+      await scenario('AC-20', '零外部请求与点击响应性能 (REQ-N-002/003)', async () => {
+        const resources = performance.getEntriesByType('resource');
+        const external = resources.filter((r) => {
+          try {
+            return new URL(r.name).origin !== location.origin;
+          } catch {
+            return true;
+          }
+        });
+        assert(external.length === 0, `不应有外部请求，实际 ${external.map((r) => r.name).join(', ')}`);
+        record('AC-20-info', '资源请求', true, `${resources.length} 个资源，全部同源`);
+
+        newGame(1801);
+        const layout = layoutFor(1801, 0, 'beginner');
+        click(cellAt(0));
+
+        let worst = 0;
+        const targets = safeIndices(layout).filter(isPlainHidden).slice(0, 25);
+        for (const t of targets) {
+          const start = performance.now();
+          rightClick(cellAt(t));
+          worst = Math.max(worst, performance.now() - start);
+        }
+        assert(worst < 50, `单次操作最坏耗时 ${worst.toFixed(2)}ms，应小于 50ms`);
+        record('AC-20-perf', '单次操作最坏耗时', true, `${worst.toFixed(2)}ms（阈值 50ms）`);
+      });
+
+      // ═════════════════════════════════════════════════════════
+      // 汇总输出
+      // ═════════════════════════════════════════════════════════
+      for (let i = 1; i < 5000; i += 1) clearInterval(i);
+
+      const failed = results.filter((r) => !r.ok);
+      const report = {
+        total: results.length,
+        pass: results.length - failed.length,
+        fail: failed.length,
+        errors,
+        failedList: failed,
+        results,
+      };
+
+      document.body.innerHTML = '';
+      const pre = document.createElement('pre');
+      pre.id = 'e2e-report';
+      pre.textContent = `===E2E-BEGIN===${JSON.stringify(report)}===E2E-END===`;
+      document.body.appendChild(pre);
+      document.title = `E2E ${report.pass}/${report.total}`;
+    </script>
+  </body>
+</html>

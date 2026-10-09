@@ -1,0 +1,17 @@
+{
+  "name": "minesweeper-web",
+  "version": "1.0.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "description": "网页版扫雷 · 以 SDD（规格驱动开发）交付 · 零运行时依赖",
+  "scripts": {
+    "serve": "node tools/serve.js",
+    "test": "node --test --test-isolation=none \"tests/*.test.js\"",
+    "test:isolated": "node --test \"tests/*.test.js\"",
+    "verify": "node tools/verify.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

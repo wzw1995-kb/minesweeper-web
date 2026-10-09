@@ -1,0 +1,23 @@
+# ── 依赖 ──────────────────────────────────────────────
+# 本项目零依赖，正常情况下不会出现；防止将来误提交
+node_modules/
+
+# ── 工具运行产物 ──────────────────────────────────────
+# tools/verify.mjs 第 6/7 阶段会产生这些，正常会自动清理；
+# 万一中途异常退出，避免它们被提交进来
+.tmp-browser-profile/
+.e2e-dom.txt
+.inline-script-check.js
+*.log
+
+# ── Windows 沙箱 / 权限诊断产物 ────────────────────────
+acl-backup-*.json
+acl-backup-*.json.ps1
+acl-report-*.jsonl
+
+# ── 编辑器 / 操作系统 ─────────────────────────────────
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store

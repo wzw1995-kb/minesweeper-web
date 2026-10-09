@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="description" content="网页版扫雷 · 以规格驱动开发（SDD）交付 · 零运行时依赖" />
+    <title>扫雷 · Minesweeper</title>
+    <link rel="stylesheet" href="./src/styles/theme.css" />
+    <link rel="stylesheet" href="./src/styles/main.css" />
+  </head>
+  <body>
+    <main class="app">
+      <h1 class="sr-only">扫雷</h1>
+
+      <noscript>
+        <div class="fatal" role="alert">
+          <strong>本应用需要 JavaScript</strong>
+          <p>当前浏览器禁用了 JavaScript，因此无法开始游戏。请在浏览器设置中允许本页面运行脚本。</p>
+        </div>
+      </noscript>
+
+      <header class="hud">
+        <div class="hud__group">
+          <label class="sr-only" for="difficulty">难度</label>
+          <select id="difficulty" class="hud__select" aria-label="难度"></select>
+          <button id="new-game" class="hud__face" type="button" aria-label="重新开始 (R)">🙂</button>
+        </div>
+
+        <div class="hud__stats">
+          <span class="stat">
+            <span class="stat__icon" aria-hidden="true">🚩</span>
+            <span id="mine-count" class="stat__value" role="status" aria-live="polite" aria-label="剩余雷数">010</span>
+          </span>
+          <span class="stat">
+            <span class="stat__icon" aria-hidden="true">⏱</span>
+            <span id="timer" class="stat__value" role="timer" aria-label="用时">000</span>
+          </span>
+          <span class="stat stat--best">
+            <span aria-hidden="true">🏆</span>
+            <span class="stat__label">最佳</span>
+            <span id="best-time" class="stat__value">--</span>
+          </span>
+        </div>
+
+        <div class="hud__tools">
+          <button id="undo" class="tool" type="button" aria-label="撤销 (U)" disabled>↶</button>
+          <button id="hint" class="tool" type="button" aria-label="提示 (H)">💡</button>
+          <button id="theme" class="tool" type="button" aria-label="切换主题">🌙</button>
+          <button id="flag-mode" class="tool tool--wide" type="button" aria-pressed="false">
+            <span aria-hidden="true">🚩</span><span>旗标模式</span>
+          </button>
+        </div>
+      </header>
+
+      <div id="board" class="board" role="grid" aria-label="扫雷棋盘"></div>
+
+      <p id="message" class="message" role="status" aria-live="polite"></p>
+      <p id="storage-warning" class="warning" hidden>
+        浏览器本地存储不可用，本次的最佳成绩不会被保存。
+      </p>
+    </main>
+
+    <!--
+      启动兜底提示。三点设计约束：
+
+      1. **必须是传统脚本（非 module）**：ES Module 在 file:// 下会因 origin 为 null
+         被同源策略直接拒绝执行，浏览器却不给任何可见提示 —— 用户只看到一片空白
+         （难度下拉框为空、棋盘为空）。传统脚本不受此限制，能把真正的原因说出来。
+      2. **必须放在 </body> 前**：这样 document.body 已存在，提示条能可靠地插进
+         .app 里。放在 <head> 里会插到 <html> 下、<head> 之前，结构非法且渲染不可靠。
+      3. **仍然早于 module 执行**：module 脚本是 deferred 的，会在整个文档解析完成后才跑，
+         所以这里的 error 监听能捕获到模块加载/执行阶段的错误。
+
+      它兜住所有"模块没跑起来"的情形：file:// 访问、脚本报错、资源 404、JS 被禁用、CSP 拦截。
+      对应需求 REQ-N-008。
+    -->
+    <script>
+      (function () {
+        var firstError = null;
+
+        window.addEventListener(
+          'error',
+          function (event) {
+            if (firstError) return;
+            var node = event && (event.target || event.srcElement);
+            var where = node && node.tagName ? '（元素 <' + node.tagName.toLowerCase() + '>）' : '';
+            firstError = ((event && event.message) || (event && event.type) || '未知错误') + where;
+          },
+          true,
+        );
+
+        var isFile = location.protocol === 'file:';
+
+        function showBanner(title, lines) {
+          if (document.getElementById('boot-fatal')) return;
+          var box = document.createElement('div');
+          box.id = 'boot-fatal';
+          box.className = 'fatal';
+          box.setAttribute('role', 'alert');
+
+          var heading = document.createElement('strong');
+          heading.textContent = title;
+          box.appendChild(heading);
+
+          for (var i = 0; i < lines.length; i += 1) {
+            var p = document.createElement('p');
+            p.textContent = lines[i];
+            box.appendChild(p);
+          }
+
+          var app = document.querySelector('.app') || document.body;
+          app.insertBefore(box, app.firstChild);
+        }
+
+        if (isFile) {
+          showBanner('请通过 HTTP 打开本页面，不要双击文件', [
+            '本应用使用 ES Module，浏览器出于同源策略会拒绝在 file:// 下执行它们：页面框架能显示，但难度选项和棋盘都不会出现。',
+            '请在项目根目录执行：  npm run serve',
+            '然后在浏览器地址栏访问：  127.0.0.1:8123',
+          ]);
+        }
+
+        // 看门狗：只要棋盘还是没有格子，就说明模块没跑起来。
+        // 这是所有失败情形（file://、404、脚本报错、JS 被禁用）的统一兜底。
+        setTimeout(function () {
+          var board = document.getElementById('board');
+          if (!board || board.childElementCount > 0) return; // 已正常启动
+
+          showBanner('应用没有启动', [
+            isFile
+              ? '原因：页面是通过 file:// 打开的。请改用 HTTP 方式（见上方说明）。'
+              : '模块脚本未能执行' + (firstError ? '，捕获到的错误：' + firstError : '，且未捕获到具体错误。'),
+            '请按 F12 打开控制台：若看到红色的 CORS 或 404 报错，多半是访问方式或资源路径的问题。',
+            '若本地服务器尚未运行，请在项目根目录执行：  npm run serve',
+          ]);
+        }, 1500);
+      })();
+    </script>
+
+    <script type="module" src="./src/ui/main.js"></script>
+  </body>
+</html>

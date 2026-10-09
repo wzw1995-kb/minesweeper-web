@@ -1,0 +1,345 @@
+/* ============================================================
+ * 布局与组件样式（T17）
+ * 覆盖需求：REQ-F-030（状态栏）、REQ-F-054（触控）、REQ-F-055（响应式）
+ * ============================================================ */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  /* REQ-F-055：绝不出现横向滚动条 */
+  overflow-x: hidden;
+}
+
+body {
+  min-height: 100vh;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 15px;
+  line-height: 1.5;
+  /* REQ-F-054：阻止移动端长按选中文本 */
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.75rem;
+  max-width: 100%;
+  padding: 0.75rem 1rem 1.5rem;
+}
+
+/* ── 状态栏（REQ-F-030）──────────────────────────────────── */
+
+.hud {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem 0.75rem;
+  width: 100%;
+  max-width: 60rem;
+  padding: 0.6rem 0.75rem;
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+
+.hud__group,
+.hud__tools {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.hud__stats {
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+  margin-inline: auto;
+}
+
+.hud__select {
+  padding: 0.3rem 0.45rem;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+  font: inherit;
+  font-size: 0.9rem;
+}
+
+.hud__face {
+  width: 2.4rem;
+  height: 2.4rem;
+  padding: 0;
+  background: var(--bg);
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+  font-size: 1.25rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.hud__face:hover,
+.tool:hover:not(:disabled) {
+  background: var(--cell-hidden-hover);
+}
+
+.stat {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  white-space: nowrap;
+}
+
+.stat__icon {
+  font-size: 0.95rem;
+}
+
+.stat__value {
+  min-width: 2.4em;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 1.05rem;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
+.stat--best .stat__value {
+  color: var(--accent);
+}
+
+.tool {
+  min-width: 2.2rem;
+  height: 2.2rem;
+  padding: 0 0.5rem;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+  font: inherit;
+  font-size: 1rem;
+  cursor: pointer;
+}
+
+.tool--wide {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.85rem;
+}
+
+.tool.is-active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.tool:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* ── 棋盘（REQ-F-055 的关键：单元格尺寸随视口收缩）────────── */
+
+.board {
+  /* 棋盘自身的边框宽度。必须从 --cell-size 的计算中扣除：
+     box-sizing 为 border-box，max-width:100% 会把棋盘的**边框盒**钳到容器宽度，
+     若公式只减 .app 的内边距而不减这 4px，最后一列的右边缘就会被 overflow:hidden 裁掉。 */
+  --board-border: 2px;
+
+  /* 同时受三个上界约束：
+     - 绝对上限 34px
+     - 视口宽度能容纳 --cols 列（扣除 .app 内边距与棋盘边框，保证不出现横向滚动条）
+     - 视口高度扣掉状态栏后能容纳 --rows 行 */
+  --cell-size: min(
+    34px,
+    calc((100vw - 2rem - 2 * var(--board-border)) / var(--cols, 9)),
+    calc((100vh - 13rem) / var(--rows, 9))
+  );
+  --cell-size: min(
+    34px,
+    calc((100vw - 2rem - 2 * var(--board-border)) / var(--cols, 9)),
+    calc((100dvh - 13rem) / var(--rows, 9))
+  );
+
+  display: flex;
+  flex-direction: column;
+  width: max-content;
+  max-width: 100%;
+  margin-inline: auto;
+  border: var(--board-border) solid var(--cell-border);
+  border-radius: var(--radius);
+  /* 让圆角裁掉四个角格的直角。上面 --cell-size 的公式已扣除边框，
+     正常情况下不会裁掉任何有效像素；tools/browser-e2e.html 的 AC-18
+     有"一行单元格总宽 == 棋盘内容宽度"的断言来守住这一点。 */
+  overflow: hidden;
+  box-shadow: var(--shadow);
+  touch-action: manipulation;
+}
+
+.board__row {
+  display: flex;
+}
+
+.cell {
+  display: grid;
+  place-items: center;
+  width: var(--cell-size);
+  height: var(--cell-size);
+  padding: 0;
+  /* 去掉浏览器对 button 的原生外观，否则部分浏览器会用 appearance:auto
+     覆盖我们设置的背景与边框（REQ-N-005 跨浏览器一致性） */
+  appearance: none;
+  -webkit-appearance: none;
+  background: var(--cell-hidden);
+  color: var(--text);
+  border: 1px solid var(--cell-border);
+  border-radius: 0;
+  font-family: var(--font-mono);
+  font-size: calc(var(--cell-size) * 0.56);
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+  transition: background-color 70ms linear;
+}
+
+/* 说明：render.js 还会给光标所在格加 is-cursor 类。它同时承担一个技术职责——
+   syncBoard 用 className 组成 signature，靠它让"仅光标移动"也能改变 signature，
+   从而把 roving tabindex 刷到 DOM 上。焦点可见性由下面的 :focus-visible 负责。 */
+
+.cell:hover:not(.is-revealed) {
+  background: var(--cell-hidden-hover);
+}
+
+/* roving tabindex 的焦点指示（REQ-F-051） */
+.cell:focus-visible {
+  outline: 2px solid var(--cursor);
+  outline-offset: -3px;
+  z-index: 2;
+}
+
+.cell.is-revealed {
+  background: var(--cell-revealed);
+  border-color: var(--cell-border-revealed);
+  cursor: default;
+}
+
+.cell.is-flagged,
+.cell.is-question {
+  font-family: var(--font-ui);
+  font-size: calc(var(--cell-size) * 0.62);
+}
+
+.cell.is-question {
+  color: var(--text-muted);
+}
+
+/* 数字配色（REQ-F-060） */
+.cell.n1 { color: var(--n1); }
+.cell.n2 { color: var(--n2); }
+.cell.n3 { color: var(--n3); }
+.cell.n4 { color: var(--n4); }
+.cell.n5 { color: var(--n5); }
+.cell.n6 { color: var(--n6); }
+.cell.n7 { color: var(--n7); }
+.cell.n8 { color: var(--n8); }
+
+/* 终局揭示（REQ-F-024） */
+.cell.is-mine {
+  background: var(--cell-revealed);
+  font-family: var(--font-ui);
+  font-size: calc(var(--cell-size) * 0.62);
+}
+
+.cell.is-exploded {
+  background: var(--danger-bg);
+  border-color: var(--danger-bg);
+  font-family: var(--font-ui);
+  font-size: calc(var(--cell-size) * 0.62);
+}
+
+.cell.is-wrong {
+  color: var(--danger-text);
+  font-family: var(--font-ui);
+  font-size: calc(var(--cell-size) * 0.62);
+}
+
+/* ── 文本区 ─────────────────────────────────────────────── */
+
+.message {
+  min-height: 1.5em;
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.9rem;
+  text-align: center;
+}
+
+/* 启动兜底提示（由 index.html 里的传统脚本注入）。
+   存在的意义：模块没能执行时页面本来是**完全空白且毫无提示**的，
+   用户无从判断是代码坏了、路径错了、还是打开方式不对。 */
+.fatal {
+  width: 100%;
+  max-width: 60rem;
+  padding: 0.85rem 1rem;
+  background: var(--danger-bg);
+  color: #fff;
+  border-radius: var(--radius);
+  font-size: 0.9rem;
+  line-height: 1.65;
+  text-align: left;
+}
+
+.fatal strong {
+  display: block;
+  margin-bottom: 0.4rem;
+  font-size: 1.02rem;
+}
+
+.fatal p {
+  margin: 0.25rem 0;
+}
+
+.warning {
+  margin: 0;
+  padding: 0.4rem 0.7rem;
+  background: var(--danger-bg);
+  color: #fff;
+  border-radius: 6px;
+  font-size: 0.82rem;
+  text-align: center;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cell {
+    transition: none;
+  }
+}
