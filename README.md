@@ -203,3 +203,5 @@ UI 验收的**主路径**是 `spec/04-acceptance-checklist.md` 的 AC-00 ~ AC-20
 ## License
 
 [MIT](LICENSE) © 2026 minesweeper-web contributors
+
+*** 2026.10.12****
